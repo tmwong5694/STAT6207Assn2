@@ -1,0 +1,6 @@
+# Minimal dependencies for basic LSTM training script
+numpy>=1.24
+matplotlib>=3.7
+# Install a recent PyTorch. On Apple Silicon, this should pull an arm64 wheel with MPS support.
+torch>=2.2
+
