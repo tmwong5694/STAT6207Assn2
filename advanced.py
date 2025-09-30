@@ -1,415 +1,421 @@
-# Advanced non-recurrent training script for sequence regression using PyTorch
-# - Trains a CNN-based regressor (no LSTM/RNN/Transformer) on X.npy, y.npy
-# - Compares different values of one hyperparameter (hidden_size)
+# Advanced RNN (GRU) training script for sequence regression using PyTorch
+# - Trains a GRU-based regressor (no LSTM, no Transformer) on X.npy, y.npy
+# - Compares different values of one hyperparameter (now: number of epochs)
 # - Evaluates on X_test.npy, y_test.npy and saves plots to advanced_results.pdf
 # - Runs inference on X_test2.npy and saves predictions to a2_test.json
 # - Saves a summary to advanced_results.json
 #
-# Notes on shapes:
-#   * X may be (N, T) or (N, T, F); we convert to (N, T, F)
-#   * y may be (N,), (N,1) for per-sequence regression, or (N, T) / (N, T,1) for per-timestep
-#     - For per-sequence targets, the model produces (N, 1)
-#     - For per-timestep targets, the model produces (N, T, 1)
-#
-# This script avoids any recurrent or attention-based modules and uses 1D convolutions.
+# Shapes:
+#   * X may be (N, T) or (N, T, F) -> we ensure (N, T, F)
+#   * y may be (N,), (N,1) per-sequence or (N, T)[,1] per-timestep
+#     - seq_to_one: output (N, 1)
+#     - seq_to_seq: output (N, T, 1)
 
 import os
 import json
 import random
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
-
-try:
-    import torch
-    import torch.nn as nn
-except Exception as e:  # pragma: no cover
-    raise SystemExit(
-        "PyTorch is required for this script. Please install requirements first (see requirements.txt).\n"
-        f"Import error: {e}"
-    )
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")  # headless-safe backend for saving to files
-    import matplotlib.pyplot as plt
-except Exception as e:
-    raise SystemExit(
-        "matplotlib is required for plotting. Please install requirements first (see requirements.txt).\n"
-        f"Import error: {e}"
-    )
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
 
 
-# -----------------------------
-# Config and utilities
-# -----------------------------
+class Model:
+    def __init__(self,
+                 lr: float = 1e-3,
+                 weight_decay: float = 1e-5,
+                 batch_size: int = 128,
+                 max_epochs: int = 15,
+                 num_layers: int = 2,
+                 dropout: float = 0.1,
+                 val_ratio: float = 0.1,
+                 seed: int = 42,
+                 # Hyperparameter comparison now focuses on training epochs
+                 epochs_grid: Tuple[int, ...] = (5, 10, 15),
+                 # Fixed RNN hidden size
+                 base_hidden_size: int = 64,
+                 plot_pdf_path: str = None,
+                 results_json_path: str = None,
+                 a2_json_path: str = None):
+        # Hyperparameters
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs  # default cap; per-run uses epochs_grid value
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.val_ratio = val_ratio
+        self.seed = seed
+        self.epochs_grid = epochs_grid
+        self.base_hidden_size = base_hidden_size
 
-@dataclass
-class Config:
-    data_dir: str = os.path.join(os.path.dirname(__file__), "data")
-    batch_size: int = 128
-    lr: float = 1e-3
-    weight_decay: float = 1e-5
-    max_epochs: int = 15  # keep modest for quick experimentation
-    num_layers: int = 3
-    kernel_size: int = 5
-    dropout: float = 0.1
-    val_ratio: float = 0.1
-    seed: int = 42
-    num_workers: int = 0
-    hidden_size_grid: Tuple[int, ...] = (32, 64, 128)  # hyperparameter to compare
-    plot_pdf_path: str = os.path.join(os.path.dirname(__file__), "advanced_results.pdf")
-    results_json_path: str = os.path.join(os.path.dirname(__file__), "advanced_results.json")
-    a2_json_path: str = os.path.join(os.path.dirname(__file__), "a2_test.json")
+        # Output paths (default to repo root)
+        base_dir = os.path.dirname(__file__)
+        self.plot_pdf_path = plot_pdf_path or os.path.join(base_dir, "advanced_results.pdf")
+        self.results_json_path = results_json_path or os.path.join(base_dir, "advanced_results.json")
+        self.a2_json_path = a2_json_path or os.path.join(base_dir, "a2_test.json")
 
+        # Runtime state
+        self.device = self._select_device()
+        self._set_seed(self.seed)
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        # Data placeholders (set by load_data)
+        self.X = self.y = self.X_test = self.y_test = self.X_test2 = None
+        self.mu = self.std = None
+        self.seq_to_seq = False
+        self.out_dim = 1
 
+        # Trained model / best config
+        self.best_model: nn.Module | None = None
+        self.best_hidden_size: int | None = None
+        self.best_max_epochs: int | None = None
+        self.runs: List[Dict] = []
 
-def select_device():
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    # ------------------
+    # Utilities
+    # ------------------
+    def _set_seed(self, seed: int):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
+    def _select_device(self):
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
 
-# -----------------------------
-# Data loading and preprocessing
-# -----------------------------
+    # ------------------
+    # Data
+    # ------------------
+    def load_data(self, folder: str):
+        """Load arrays and keep them on the instance to avoid reloading repeatedly."""
+        X = np.load(os.path.join(folder, 'X.npy'))
+        y = np.load(os.path.join(folder, 'y.npy'))
+        X_test = np.load(os.path.join(folder, 'X_test.npy'))
+        y_test = np.load(os.path.join(folder, 'y_test.npy'))
+        X_test2 = np.load(os.path.join(folder, 'X_test2.npy'))
 
-def load_arrays_all(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    X = np.load(os.path.join(data_dir, "X.npy"))
-    y = np.load(os.path.join(data_dir, "y.npy"))
-    X_te = np.load(os.path.join(data_dir, "X_test.npy"))
-    y_te = np.load(os.path.join(data_dir, "y_test.npy"))
-    X_te2 = np.load(os.path.join(data_dir, "X_test2.npy"))
-    return X, y, X_te, y_te, X_te2
+        X = self._ensure_3d_X(X)
+        X_test = self._ensure_3d_X(X_test)
+        X_test2 = self._ensure_3d_X(X_test2)
 
+        y, out_dim, seq_to_seq = self._make_targets(y)
+        y_test, _, _ = self._make_targets(y_test)
 
-def ensure_3d_X(X: np.ndarray) -> np.ndarray:
-    # Ensure shape (N, T, F)
-    if X.ndim == 3:
-        return X
-    if X.ndim == 2:
-        return X[..., None]
-    raise ValueError(f"X must be 2D or 3D, got shape {X.shape}")
+        # Normalize by train statistics
+        mu = X.mean(axis=(0, 1), keepdims=True)
+        std = X.std(axis=(0, 1), keepdims=True) + 1e-8
 
-
-def make_targets(y: np.ndarray) -> Tuple[np.ndarray, int, bool]:
-    # Returns (y_processed, out_dim, seq_to_seq)
-    if y.ndim == 1:
-        y = y[:, None]
-    elif y.ndim == 3 and y.shape[-1] == 1:
-        y = y.squeeze(-1)  # (N, T)
-    # After this, y is either (N, 1) for per-seq, or (N, T) for per-step
-    if y.ndim == 2 and y.shape[1] == 1:
-        out_dim = 1
-        seq_to_seq = False
-    elif y.ndim == 2:  # (N, T)
-        out_dim = 1
-        seq_to_seq = True
-        y = y[..., None]  # (N, T, 1)
-    else:
-        raise ValueError(f"Unsupported y shape {y.shape}. Expected (N,), (N,1), or (N,T)[,1].")
-    return y, out_dim, seq_to_seq
-
-
-def fit_normalizer(X_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # Compute mean/std over (N, T)
-    mu = X_train.mean(axis=(0, 1), keepdims=True)
-    std = X_train.std(axis=(0, 1), keepdims=True) + 1e-8
-    return mu, std
-
-
-def apply_normalizer(X: np.ndarray, mu: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (X - mu) / std
-
-
-def train_val_split_tensor(tensor: torch.Tensor, val_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    n = tensor.shape[0]
-    n_val = max(1, int(n * val_ratio)) if n > 10 else max(1, int(n * 0.2))
-    idx = torch.randperm(n)
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
-    return tensor[train_idx], tensor[val_idx]
-
-
-# -----------------------------
-# CNN model (no recurrence)
-# -----------------------------
-
-class CNNRegressor(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, kernel_size: int, dropout: float, out_dim: int, seq_to_seq: bool):
-        super().__init__()
+        self.X = (X - mu) / std
+        self.y = y
+        self.X_test = (X_test - mu) / std
+        self.y_test = y_test
+        self.X_test2 = (X_test2 - mu) / std
+        self.mu, self.std = mu, std
+        self.out_dim = out_dim
         self.seq_to_seq = seq_to_seq
-        layers: List[nn.Module] = []
-        in_ch = input_size  # treat feature dim as channels for Conv1d
-        for i in range(num_layers):
-            out_ch = hidden_size
-            layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding="same"))
-            layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_ch = out_ch
-        self.backbone = nn.Sequential(*layers)
-        if seq_to_seq:
-            # map hidden_size -> out_dim per timestep
-            self.head_seq = nn.Conv1d(in_ch, out_dim, kernel_size=1)
-            self.head_final = None
+
+        return X, y, X_test, y_test
+
+    @staticmethod
+    def _ensure_3d_X(X: np.ndarray) -> np.ndarray:
+        if X.ndim == 3:
+            return X
+        if X.ndim == 2:
+            return X[..., None]
+        raise ValueError(f"X must be 2D or 3D, got shape {X.shape}")
+
+    @staticmethod
+    def _make_targets(y: np.ndarray) -> Tuple[np.ndarray, int, bool]:
+        if y.ndim == 1:
+            y = y[:, None]
+        elif y.ndim == 3 and y.shape[-1] == 1:
+            y = y.squeeze(-1)  # (N, T)
+        if y.ndim == 2 and y.shape[1] == 1:
+            out_dim = 1
+            seq_to_seq = False
+        elif y.ndim == 2:  # (N, T)
+            out_dim = 1
+            seq_to_seq = True
+            y = y[..., None]  # (N, T, 1)
         else:
-            # global average pool over time then linear to out_dim
-            self.head_seq = None
-            self.head_final = nn.Linear(in_ch, out_dim)
+            raise ValueError(f"Unsupported y shape {y.shape}. Expected (N,), (N,1), or (N,T)[,1].")
+        return y, out_dim, seq_to_seq
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, F)
-        x = x.transpose(1, 2)  # -> (B, F, T)
-        h = self.backbone(x)   # (B, H, T)
-        if self.seq_to_seq:
-            y = self.head_seq(h)           # (B, out_dim, T)
-            y = y.transpose(1, 2)          # -> (B, T, out_dim)
-            return y
-        else:
-            # global average pooling over time dimension
-            h_avg = h.mean(dim=-1)         # (B, H)
-            y = self.head_final(h_avg)     # (B, out_dim)
-            return y
+    # ------------------
+    # Model (RNN/GRU)
+    # ------------------
+    class RNNRegressor(nn.Module):
+        def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, out_dim: int, seq_to_seq: bool):
+            super().__init__()
+            self.seq_to_seq = seq_to_seq
+            self.hidden_size = hidden_size
+            # Project features to hidden size if needed
+            self.input_proj = nn.Linear(input_size, hidden_size) if input_size != hidden_size else nn.Identity()
+            # Use GRU (no LSTM)
+            self.rnn = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
+            )
+            if seq_to_seq:
+                self.head_seq = nn.Linear(hidden_size, out_dim)
+                self.head_final = None
+            else:
+                self.head_seq = None
+                self.head_final = nn.Linear(hidden_size, out_dim)
+            self.dropout = nn.Dropout(dropout)
 
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # x: (B, T, F)
+            x = self.input_proj(x)  # (B, T, H)
+            out, h_n = self.rnn(x)  # out: (B, T, H), h_n: (L, B, H)
+            if self.seq_to_seq:
+                y = self.head_seq(self.dropout(out))  # (B, T, out_dim)
+                return y
+            else:
+                last = h_n[-1]  # (B, H) last layer's hidden state
+                last = self.dropout(last)
+                return self.head_final(last)  # (B, out_dim)
 
-# -----------------------------
-# Training and evaluation
-# -----------------------------
+    def _build_model(self, hidden_size: int) -> nn.Module:
+        input_size = self.X.shape[-1]
+        return Model.RNNRegressor(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            out_dim=self.out_dim,
+            seq_to_seq=self.seq_to_seq,
+        ).to(self.device)
 
-def run_training_for_hidden_size(hidden_size: int, cfg: Config, device, X_t, y_t, Xval_t, yval_t, out_dim: int, seq_to_seq: bool) -> Dict:
-    input_size = X_t.shape[-1]
-    model = CNNRegressor(
-        input_size=input_size,
-        hidden_size=hidden_size,
-        num_layers=cfg.num_layers,
-        kernel_size=cfg.kernel_size,
-        dropout=cfg.dropout,
-        out_dim=out_dim,
-        seq_to_seq=seq_to_seq,
-    ).to(device)
+    # ------------------
+    # Training / Eval
+    # ------------------
+    @staticmethod
+    def _make_split_indices(n: int, val_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        n_val = max(1, int(n * val_ratio)) if n > 10 else max(1, int(n * 0.2))
+        idx = torch.randperm(n)
+        val_idx = idx[:n_val]
+        train_idx = idx[n_val:]
+        return train_idx, val_idx
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    def _train_one(self, hidden_size: int, num_epochs: int, Xtr_t, ytr_t, Xval_t, yval_t) -> Dict:
+        model = self._build_model(hidden_size)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-    train_ds = torch.utils.data.TensorDataset(X_t, y_t)
-    val_ds = torch.utils.data.TensorDataset(Xval_t, yval_t)
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+        train_ds = torch.utils.data.TensorDataset(Xtr_t, ytr_t)
+        val_ds = torch.utils.data.TensorDataset(Xval_t, yval_t)
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=0)
 
-    train_losses: List[float] = []
-    val_losses: List[float] = []
+        train_losses: List[float] = []
+        val_losses: List[float] = []
+        best_val = float('inf')
+        best_state = None
 
-    best_val = float("inf")
-    best_state = None
-
-    for epoch in range(1, cfg.max_epochs + 1):
-        model.train()
-        running = 0.0
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            optimizer.zero_grad()
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            loss.backward()
-            optimizer.step()
-            running += loss.item() * xb.size(0)
-        train_loss = running / len(train_ds)
-        train_losses.append(train_loss)
-
-        model.eval()
-        with torch.no_grad():
+        for epoch in range(1, num_epochs + 1):
+            model.train()
             running = 0.0
-            for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
+            for xb, yb in train_loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+                optimizer.zero_grad()
                 pred = model(xb)
                 loss = criterion(pred, yb)
+                loss.backward()
+                # optional: gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
                 running += loss.item() * xb.size(0)
-            val_loss = running / max(1, len(val_ds))
-        val_losses.append(val_loss)
+            train_loss = running / len(train_ds)
+            train_losses.append(train_loss)
 
-        if val_loss < best_val:
-            best_val = val_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            model.eval()
+            with torch.no_grad():
+                running = 0.0
+                for xb, yb in val_loader:
+                    xb = xb.to(self.device)
+                    yb = yb.to(self.device)
+                    pred = model(xb)
+                    loss = criterion(pred, yb)
+                    running += loss.item() * xb.size(0)
+                val_loss = running / max(1, len(val_ds))
+            val_losses.append(val_loss)
 
-        if epoch % max(1, cfg.max_epochs // 5) == 0 or epoch == 1 or epoch == cfg.max_epochs:
-            print(f"[hidden_size={hidden_size}] Epoch {epoch:03d}/{cfg.max_epochs} | train MSE={train_loss:.6f} | val MSE={val_loss:.6f}")
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    # Restore best
-    if best_state is not None:
-        model.load_state_dict(best_state)
+            if epoch % max(1, num_epochs // 5) == 0 or epoch == 1 or epoch == num_epochs:
+                print(f"[epochs={num_epochs}, hidden_size={hidden_size}] Epoch {epoch:03d}/{num_epochs} | train MSE={train_loss:.6f} | val MSE={val_loss:.6f}")
 
-    return {
-        "hidden_size": hidden_size,
-        "model": model,
-        "train_losses": train_losses,
-        "val_losses": val_losses,
-        "best_val_mse": float(best_val),
-    }
+        if best_state is not None:
+            model.load_state_dict(best_state)
 
+        return {
+            "hidden_size": hidden_size,
+            "max_epochs": int(num_epochs),
+            "model": model,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "best_val_mse": float(best_val),
+        }
 
-def evaluate_model(model: nn.Module, device, X: torch.Tensor, y: torch.Tensor) -> Tuple[float, np.ndarray]:
-    criterion = nn.MSELoss()
-    model.eval()
-    with torch.no_grad():
-        yhat = model(X.to(device))
-        mse = criterion(yhat, y.to(device)).item()
-        yhat_np = yhat.detach().cpu().numpy()
-    return mse, yhat_np
+    def train(self):
+        assert self.X is not None, "Call load_data(folder) first."
+        # Prepare tensors
+        X_t = torch.from_numpy(self.X.astype(np.float32))
+        y_t = torch.from_numpy(self.y.astype(np.float32))
+        # Shared split indices to keep X and y aligned
+        n = X_t.shape[0]
+        train_idx, val_idx = self._make_split_indices(n, self.val_ratio)
+        Xtr_t, Xval_t = X_t[train_idx], X_t[val_idx]
+        ytr_t, yval_t = y_t[train_idx], y_t[val_idx]
 
+        self.runs = []
+        for num_epochs in self.epochs_grid:
+            res = self._train_one(self.base_hidden_size, int(num_epochs), Xtr_t, ytr_t, Xval_t, yval_t)
+            self.runs.append(res)
 
-# -----------------------------
-# Orchestration
-# -----------------------------
+        best = min(self.runs, key=lambda r: r["best_val_mse"])
+        self.best_model = best["model"]
+        self.best_hidden_size = best["hidden_size"]
+        self.best_max_epochs = best["max_epochs"]
+        return best
 
-def main(cfg: Config) -> Dict:
-    set_seed(cfg.seed)
-    device = select_device()
+    def evaluate(self) -> Tuple[float, np.ndarray, np.ndarray]:
+        assert self.best_model is not None, "Train the model first."
+        Xte_t = torch.from_numpy(self.X_test.astype(np.float32)).to(self.device)
+        yte_t = torch.from_numpy(self.y_test.astype(np.float32)).to(self.device)
 
-    # Load and shape data
-    X, y, X_te, y_te, X_te2 = load_arrays_all(cfg.data_dir)
-    X = ensure_3d_X(X)
-    X_te = ensure_3d_X(X_te)
-    X_te2 = ensure_3d_X(X_te2)
-    y, out_dim, seq_to_seq = make_targets(y)
-    y_te, _, _ = make_targets(y_te)
+        self.best_model.eval()
+        criterion = nn.MSELoss()
+        with torch.no_grad():
+            yhat_te = self.best_model(Xte_t)
+            test_mse = criterion(yhat_te, yte_t).item()
+            yhat_te_np = yhat_te.detach().cpu().numpy()
 
-    # Fit normalizer on train only, apply to others
-    mu, std = fit_normalizer(X)
-    X = apply_normalizer(X, mu, std)
-    X_te = apply_normalizer(X_te, mu, std)
-    X_te2 = apply_normalizer(X_te2, mu, std)
+            Xte2_t = torch.from_numpy(self.X_test2.astype(np.float32)).to(self.device)
+            yhat_te2 = self.best_model(Xte2_t).detach().cpu().numpy()
 
-    # Torch tensors
-    X_t = torch.from_numpy(X.astype(np.float32))
-    y_t = torch.from_numpy(y.astype(np.float32))
-    Xte_t = torch.from_numpy(X_te.astype(np.float32))
-    yte_t = torch.from_numpy(y_te.astype(np.float32))
-    Xte2_t = torch.from_numpy(X_te2.astype(np.float32))
+        return float(test_mse), yhat_te_np, yhat_te2
 
-    # Train/Val split
-    Xtr_t, Xval_t = train_val_split_tensor(X_t, cfg.val_ratio)
-    ytr_t, yval_t = train_val_split_tensor(y_t, cfg.val_ratio)
+    # ------------------
+    # Reporting
+    # ------------------
+    def plot_and_save(self, test_mse: float, yhat_te_np: np.ndarray):
+        # Figure: (1) Validation MSE vs epoch for each epochs setting; (2) test visualization
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-    # Hyperparameter sweep over hidden_size
-    runs: List[Dict] = []
-    for hs in cfg.hidden_size_grid:
-        res = run_training_for_hidden_size(
-            hidden_size=hs,
-            cfg=cfg,
-            device=device,
-            X_t=Xtr_t,
-            y_t=ytr_t,
-            Xval_t=Xval_t,
-            yval_t=yval_t,
-            out_dim=out_dim,
-            seq_to_seq=seq_to_seq,
-        )
-        runs.append(res)
+        # Panel 1: loss curves across epochs for different training lengths
+        sorted_runs = sorted(self.runs, key=lambda x: x["max_epochs"]) if self.runs else []
+        unique_E = [r["max_epochs"] for r in sorted_runs]
+        # Use a consistent colormap, same color for the same hyperparam (epochs)
+        cmap = plt.cm.get_cmap('tab10', max(1, len(unique_E)))
+        color_map = {E: cmap(i % cmap.N) for i, E in enumerate(unique_E)}
+        for r in sorted_runs:
+            E = r["max_epochs"]
+            color = color_map[E]
+            # val: solid, train: dashed; same color per E
+            axes[0].plot(r["val_losses"], color=color, linestyle='-', label=f"val (E={E})")
+            axes[0].plot(r["train_losses"], color=color, linestyle='--', alpha=0.9, label=f"train (E={E})")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("MSE")
+        axes[0].set_title(f"MSE vs Epoch (RNN hidden_size={self.best_hidden_size})")
+        axes[0].legend(fontsize=8)
+        axes[0].grid(True, alpha=0.3)
 
-    # Select best by validation MSE
-    best_run = min(runs, key=lambda r: r["best_val_mse"])
-    best_model: nn.Module = best_run["model"]
-    best_hs = best_run["hidden_size"]
+        # Find best run
+        best_run = min(self.runs, key=lambda r: r["best_val_mse"]) if self.runs else None
 
-    # Evaluate on test
-    test_mse, yhat_te_np = evaluate_model(best_model, device, Xte_t, yte_t)
+        # Panel 2: Predictions visualization on test
+        if best_run is not None:
+            if not self.seq_to_seq:
+                y_true = self.y_test.squeeze(-1)
+                y_pred = yhat_te_np.squeeze(-1)
+                axes[1].scatter(y_true, y_pred, s=10, alpha=0.6)
+                minv = float(min(y_true.min(), y_pred.min()))
+                maxv = float(max(y_true.max(), y_pred.max()))
+                axes[1].plot([minv, maxv], [minv, maxv], 'r--', linewidth=1)
+                axes[1].set_xlabel("True")
+                axes[1].set_ylabel("Pred")
+                axes[1].set_title(f"Test scatter (MSE={test_mse:.4f}, E={best_run['max_epochs']})")
+            else:
+                y_true = self.y_test[0].squeeze(-1)
+                y_pred = yhat_te_np[0].squeeze(-1)
+                axes[1].plot(y_true, label="true")
+                axes[1].plot(y_pred, label="pred")
+                axes[1].set_xlabel("Timestep")
+                axes[1].set_ylabel("Value")
+                axes[1].set_title(f"Test sequence (sample 0) MSE={test_mse:.4f}, E={best_run['max_epochs']}")
+                axes[1].legend()
+        else:
+            axes[1].text(0.5, 0.5, "No run info", ha='center', va='center')
+            axes[1].set_axis_off()
 
-    # Inference on X_test2 for submission JSON
-    best_model.eval()
-    with torch.no_grad():
-        yhat_te2 = best_model(Xte2_t.to(device)).detach().cpu().numpy()
+        plt.tight_layout()
+        fig.savefig(self.plot_pdf_path, dpi=150)
+        print(f"Saved PDF plot to {self.plot_pdf_path}")
 
-    # Prepare plots and save to PDF
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        try:
+            plt.show(block=False)
+        except Exception as e:
+            print(f"Interactive display failed: {e}")
+        finally:
+            plt.close(fig)
 
-    # Left: Validation MSE vs hidden_size
-    hs_vals = [r["hidden_size"] for r in runs]
-    val_mses = [r["best_val_mse"] for r in runs]
-    axes[0].plot(hs_vals, val_mses, marker="o")
-    axes[0].set_xlabel("hidden_size")
-    axes[0].set_ylabel("Best Val MSE")
-    axes[0].set_title("Hyperparameter comparison")
-    axes[0].grid(True, alpha=0.3)
+    def save_results(self, test_mse: float, yhat_te2: np.ndarray):
+        # advanced_results.json
+        results = {
+            "device": str(self.device),
+            "input_shape": list(self.X.shape),
+            "target_shape": list(self.y.shape),
+            "test_input_shape": list(self.X_test.shape),
+            "test_target_shape": list(self.y_test.shape),
+            "seq_to_seq": bool(self.seq_to_seq),
+            "base_hidden_size": int(self.base_hidden_size),
+            "epochs_grid": list(self.epochs_grid),
+            "val_mse_by_max_epochs": {str(r["max_epochs"]): float(r["best_val_mse"]) for r in self.runs},
+            "best_hidden_size": int(self.best_hidden_size),
+            "best_max_epochs": int(self.best_max_epochs),
+            "test_mse": float(test_mse),
+            "plot_pdf_path": self.plot_pdf_path,
+        }
+        with open(self.results_json_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Saved results to {self.results_json_path}")
 
-    # Right: Predictions visualization on test
-    if not seq_to_seq:
-        y_true = yte_t.squeeze(-1).cpu().numpy()
-        y_pred = yhat_te_np.squeeze(-1)
-        axes[1].scatter(y_true, y_pred, s=10, alpha=0.6)
-        minv = float(min(y_true.min(), y_pred.min()))
-        maxv = float(max(y_true.max(), y_pred.max()))
-        axes[1].plot([minv, maxv], [minv, maxv], 'r--', linewidth=1)
-        axes[1].set_xlabel("True")
-        axes[1].set_ylabel("Pred")
-        axes[1].set_title(f"Test scatter (MSE={test_mse:.4f}, hs={best_hs})")
-    else:
-        y_true = yte_t[0].squeeze(-1).cpu().numpy()
-        y_pred = yhat_te_np[0].squeeze(-1)
-        axes[1].plot(y_true, label="true")
-        axes[1].plot(y_pred, label="pred")
-        axes[1].set_xlabel("Timestep")
-        axes[1].set_ylabel("Value")
-        axes[1].set_title(f"Test sequence (sample 0) MSE={test_mse:.4f}, hs={best_hs}")
-        axes[1].legend()
-
-    plt.tight_layout()
-    fig.savefig(cfg.plot_pdf_path, dpi=150)
-
-    # Save advanced results JSON
-    results = {
-        "device": str(device),
-        "input_shape": list(X.shape),
-        "target_shape": list(y.shape),
-        "test_input_shape": list(X_te.shape),
-        "test_target_shape": list(y_te.shape),
-        "seq_to_seq": bool(seq_to_seq),
-        "hidden_size_grid": list(cfg.hidden_size_grid),
-        "val_mse_by_hidden_size": {str(r["hidden_size"]): float(r["best_val_mse"]) for r in runs},
-        "best_hidden_size": int(best_hs),
-        "test_mse": float(test_mse),
-        "plot_pdf_path": cfg.plot_pdf_path,
-    }
-    with open(cfg.results_json_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    # Save predictions for X_test2 to a2_test.json
-    # Shape handling: if seq_to_seq, yhat_te2 is (N, T, 1) -> save list; else (N, 1) -> save float
-    submit: Dict[str, object] = {}
-    if not seq_to_seq:
-        vals = yhat_te2.squeeze(-1).tolist()
-        for i, v in enumerate(vals):
-            submit[str(i)] = float(v)
-    else:
-        vals = yhat_te2.squeeze(-1).tolist()  # list of lists
-        for i, arr in enumerate(vals):
-            submit[str(i)] = arr
-
-    with open(cfg.a2_json_path, "w") as f:
-        json.dump(submit, f, indent=2)
-
-    print(f"Saved PDF plot to {cfg.plot_pdf_path}")
-    print(f"Saved results to {cfg.results_json_path}")
-    print(f"Saved predictions to {cfg.a2_json_path}")
-
-    return {
-        **results,
-        "a2_json_path": cfg.a2_json_path,
-    }
+        # a2_test.json
+        submit: Dict[str, object] = {}
+        if not self.seq_to_seq:
+            vals = yhat_te2.squeeze(-1).tolist()
+            for i, v in enumerate(vals):
+                submit[str(i)] = float(v)
+        else:
+            vals = yhat_te2.squeeze(-1).tolist()
+            for i, arr in enumerate(vals):
+                submit[str(i)] = arr
+        with open(self.a2_json_path, "w") as f:
+            json.dump(submit, f, indent=2)
+        print(f"Saved predictions to {self.a2_json_path}")
 
 
 if __name__ == '__main__':
-    cfg = Config()
-    _ = main(cfg)
+    # Follow the simple format pattern from test.py
+    data_folder = os.path.join(os.path.dirname(__file__), 'data')
+    model = Model()
+    model.load_data(data_folder)
+    model.train()
+    test_mse, yhat_te_np, yhat_te2 = model.evaluate()
+    model.plot_and_save(test_mse, yhat_te_np)
+    model.save_results(test_mse, yhat_te2)
