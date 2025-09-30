@@ -145,25 +145,70 @@ def train_val_split_tensor(tensor: torch.Tensor, val_ratio: float) -> Tuple[torc
     return tensor[train_idx], tensor[val_idx]
 
 
+# -----------------------------
+# Data holder with caching
+# -----------------------------
+class SequenceData:
+    """Loads and holds train/test arrays once, with normalization and target shaping.
+
+    Attributes
+    - X, y: normalized train inputs and targets (numpy)
+    - X_te, y_te: normalized test inputs and targets (numpy)
+    - mu, std: normalization params computed from X
+    - out_dim, seq_to_seq: target config flags
+    """
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        X, y, X_te, y_te = load_arrays(data_dir)
+        X = ensure_3d_X(X)
+        X_te = ensure_3d_X(X_te)
+        y, out_dim, seq_to_seq = make_targets(y)
+        y_te, _, _ = make_targets(y_te)
+
+        # Fit normalizer on full training inputs (consistent with prior behavior)
+        mu = X.mean(axis=(0, 1), keepdims=True)
+        std = X.std(axis=(0, 1), keepdims=True) + 1e-8
+
+        self.mu = mu
+        self.std = std
+        self.X = (X - mu) / std
+        self.X_te = (X_te - mu) / std
+        self.y = y
+        self.y_te = y_te
+        self.out_dim = out_dim
+        self.seq_to_seq = seq_to_seq
+
+    def tensors(self):
+        X_t = torch.from_numpy(self.X.astype(np.float32))
+        y_t = torch.from_numpy(self.y.astype(np.float32))
+        Xte_t = torch.from_numpy(self.X_te.astype(np.float32))
+        yte_t = torch.from_numpy(self.y_te.astype(np.float32))
+        return X_t, y_t, Xte_t, yte_t
+
+
+_DATA_CACHE = None  # module-level cache
+
+
+def get_data(cfg: Config) -> SequenceData:
+    global _DATA_CACHE
+    if _DATA_CACHE is None or getattr(_DATA_CACHE, "data_dir", None) != cfg.data_dir:
+        _DATA_CACHE = SequenceData(cfg.data_dir)
+    return _DATA_CACHE
+
+
 def train_model(cfg: Config) -> dict:
     set_seed(cfg.seed)
     device = select_device()
 
-    # Load
-    X, y, X_te, y_te = load_arrays(cfg.data_dir)
-    X = ensure_3d_X(X)
-    X_te = ensure_3d_X(X_te)
-    y, out_dim, seq_to_seq = make_targets(y)
-    y_te, _, _ = make_targets(y_te)
-
-    # Normalize inputs (fit on train then apply to test)
-    X, X_te = normalize(X, X_te)
-
-    # Numpy -> Torch
-    X_t = torch.from_numpy(X.astype(np.float32))
-    Xte_t = torch.from_numpy(X_te.astype(np.float32))
-    y_t = torch.from_numpy(y.astype(np.float32))
-    yte_t = torch.from_numpy(y_te.astype(np.float32))
+    # Use cached data (loaded once per process)
+    data = get_data(cfg)
+    X_t, y_t, Xte_t, yte_t = data.tensors()
+    X = data.X
+    y = data.y
+    X_te = data.X_te
+    y_te = data.y_te
+    out_dim = data.out_dim
+    seq_to_seq = data.seq_to_seq
 
     # Train/Val split
     Xtr_t, Xval_t = train_val_split_tensor(X_t, cfg.val_ratio)
@@ -266,6 +311,14 @@ def train_model(cfg: Config) -> dict:
     plt.tight_layout()
     fig.savefig(cfg.plot_path, dpi=150)
     print(f"Saved plot to {cfg.plot_path}")
+
+    # Also show the plot interactively
+    try:
+        plt.show(block=False)
+    except Exception as e:
+        print(f"Interactive display failed: {e}")
+    finally:
+        plt.close(fig)
 
     results = {
         "device": str(device),
