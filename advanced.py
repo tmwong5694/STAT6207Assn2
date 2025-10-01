@@ -1,3 +1,24 @@
+"""
+Advanced sequence regression using a GRU-based RNN in PyTorch (no LSTM, no Transformer).
+
+What this file does
+- Loads training/test arrays from the local data folder and keeps them cached on the Model instance.
+- Normalizes inputs using statistics computed on the training set only.
+- Trains a GRU-based regressor while comparing different epoch budgets (epochs_grid).
+- Plots MSE vs Epoch for each run (train dashed, val solid) using fixed colors (red/green/blue),
+  saves to advanced_results.png, and also shows the figure interactively.
+- Generates predictions for X_test2.npy and writes them to a2_test.json with string keys '0', '1', ...
+
+Input/Output shapes (defensive handling)
+- X: (N, T) or (N, T, F) -> coerced to (N, T, F)
+- y: (N,), (N, 1) for sequence-level targets or (N, T)[,1] for per-timestep targets
+  * seq_to_one: model outputs (N, 1)
+  * seq_to_seq: model outputs (N, T, 1)
+
+Notes
+- Device selection prefers Apple Silicon MPS, then CUDA, else CPU.
+- The same train/val split is shared across all epoch settings for a fair comparison.
+"""
 # Advanced RNN (GRU) training script for sequence regression using PyTorch
 # - Trains a GRU-based regressor (no LSTM, no Transformer) on X.npy, y.npy
 # - Compares different values of one hyperparameter (now: number of epochs)
@@ -22,6 +43,18 @@ import matplotlib.pyplot as plt
 
 
 class Model:
+    """End-to-end trainer/evaluator for a GRU regressor.
+
+    Keeps data arrays, normalization stats, and the best trained model in memory so
+    subsequent calls do not reload from disk. Use:
+
+        model = Model()
+        model.load_data('./data')
+        model.train()            # runs multiple epoch budgets in epochs_grid
+        test_mse, yhat, y2 = model.evaluate()
+        model.plot_and_save(test_mse, yhat)
+        model.save_results(test_mse, y2)
+    """
     def __init__(self,
                  lr: float = 1e-3,
                  weight_decay: float = 1e-5,
@@ -74,6 +107,7 @@ class Model:
     # Utilities
     # ------------------
     def _set_seed(self, seed: int):
+        """Seed python, numpy, and torch RNGs for reproducibility."""
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -81,6 +115,7 @@ class Model:
             torch.cuda.manual_seed_all(seed)
 
     def _select_device(self):
+        """Choose device in order: MPS (Apple Silicon) > CUDA > CPU."""
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         if torch.cuda.is_available():
@@ -91,7 +126,11 @@ class Model:
     # Data
     # ------------------
     def load_data(self, folder: str):
-        """Load arrays and keep them on the instance to avoid reloading repeatedly."""
+        """Load arrays from folder and normalize inputs using train-set stats.
+
+        Caches arrays as attributes so repeated training doesn't reload from disk.
+        Returns the raw (unnormalized) arrays for convenience, mirroring test.py style.
+        """
         X = np.load(os.path.join(folder, 'X.npy'))
         y = np.load(os.path.join(folder, 'y.npy'))
         X_test = np.load(os.path.join(folder, 'X_test.npy'))
@@ -122,6 +161,7 @@ class Model:
 
     @staticmethod
     def _ensure_3d_X(X: np.ndarray) -> np.ndarray:
+        """Ensure input X has shape (N, T, F); append a unit feature dim if needed."""
         if X.ndim == 3:
             return X
         if X.ndim == 2:
@@ -130,6 +170,7 @@ class Model:
 
     @staticmethod
     def _make_targets(y: np.ndarray) -> Tuple[np.ndarray, int, bool]:
+        """Coerce y into supported targets and return (y_processed, out_dim, seq_to_seq)."""
         if y.ndim == 1:
             y = y[:, None]
         elif y.ndim == 3 and y.shape[-1] == 1:
@@ -149,6 +190,11 @@ class Model:
     # Model (RNN/GRU)
     # ------------------
     class RNNRegressor(nn.Module):
+        """GRU backbone for sequence regression.
+
+        - If seq_to_seq=True, predicts a value at each time step (B, T, 1).
+        - Otherwise, predicts a single value per sequence from the final hidden state (B, 1).
+        """
         def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, out_dim: int, seq_to_seq: bool):
             super().__init__()
             self.seq_to_seq = seq_to_seq
@@ -172,6 +218,13 @@ class Model:
             self.dropout = nn.Dropout(dropout)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Forward pass for the GRU regressor.
+
+            Args
+            - x: (B, T, F) float32 tensor
+            Returns
+            - (B, T, out_dim) if seq_to_seq else (B, out_dim)
+            """
             # x: (B, T, F)
             x = self.input_proj(x)  # (B, T, H)
             out, h_n = self.rnn(x)  # out: (B, T, H), h_n: (L, B, H)
@@ -184,6 +237,7 @@ class Model:
                 return self.head_final(last)  # (B, out_dim)
 
     def _build_model(self, hidden_size: int) -> nn.Module:
+        """Construct a GRU regressor with the configured depth/dropout and given hidden size."""
         input_size = self.X.shape[-1]
         return Model.RNNRegressor(
             input_size=input_size,
@@ -199,6 +253,7 @@ class Model:
     # ------------------
     @staticmethod
     def _make_split_indices(n: int, val_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create random train/val index tensors with at least one validation sample."""
         n_val = max(1, int(n * val_ratio)) if n > 10 else max(1, int(n * 0.2))
         idx = torch.randperm(n)
         val_idx = idx[:n_val]
@@ -206,6 +261,10 @@ class Model:
         return train_idx, val_idx
 
     def _train_one(self, hidden_size: int, num_epochs: int, Xtr_t, ytr_t, Xval_t, yval_t) -> Dict:
+        """Train one run for a fixed number of epochs and return learning curves and the model.
+
+        Uses Adam + MSELoss and keeps the best validation checkpoint.
+        """
         model = self._build_model(hidden_size)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -269,6 +328,7 @@ class Model:
         }
 
     def train(self):
+        """Run multiple training runs over epochs_grid and keep the best model (by val MSE)."""
         assert self.X is not None, "Call load_data(folder) first."
         # Prepare tensors
         X_t = torch.from_numpy(self.X.astype(np.float32))
@@ -291,6 +351,7 @@ class Model:
         return best
 
     def evaluate(self) -> Tuple[float, np.ndarray, np.ndarray]:
+        """Evaluate the best model on the held-out test set and prepare test2 predictions."""
         assert self.best_model is not None, "Train the model first."
         Xte_t = torch.from_numpy(self.X_test.astype(np.float32)).to(self.device)
         yte_t = torch.from_numpy(self.y_test.astype(np.float32)).to(self.device)
@@ -311,6 +372,12 @@ class Model:
     # Reporting
     # ------------------
     def plot_and_save(self, test_mse: float, yhat_te_np: np.ndarray):
+        """Plot MSE vs epoch for each epochs setting, save PNG, and show interactively.
+
+        Styling:
+        - Colors: red, green, blue mapped to the unique values in epochs_grid.
+        - Train curves: dashed; Validation curves: solid.
+        """
         # Single-plot figure: MSE vs epoch for each epochs setting
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
 
@@ -347,6 +414,11 @@ class Model:
             plt.close(fig)
 
     def save_results(self, test_mse: float, yhat_te2: np.ndarray):
+        """Save only a2_test.json with predictions for X_test2.
+
+        Keys are strings '0', '1', ... so the file matches the expected submission format.
+        For seq-to-seq targets, each value is a list of per-step predictions.
+        """
         # Only save a2_test.json with predictions for X_test2
         submit: Dict[str, object] = {}
         if not self.seq_to_seq:

@@ -1,3 +1,23 @@
+"""
+Basic sequence regression with an LSTM in PyTorch.
+
+What this file does
+- Loads training and test arrays from the local data folder.
+- Normalizes inputs using statistics computed on the training set only.
+- Trains an LSTM for sequence-to-one or sequence-to-sequence regression depending on the y shape.
+- Plots MSE vs Epoch (training dashed, validation solid), saves to PNG, and also shows the figure.
+- Writes a compact JSON summary with shapes and final test MSE.
+
+Input/Output shapes (defensive handling)
+- X: (N, T) or (N, T, F) -> coerced to (N, T, F)
+- y: (N,), (N, 1), (N, T), or (N, T, 1)
+  * If per-sequence, the model predicts (N, 1) from the last hidden state.
+  * If per-timestep, the model predicts (N, T, 1) from step-wise outputs.
+
+Notes
+- This script prefers Apple Silicon MPS when available, then CUDA, otherwise CPU.
+- Data is cached in-memory via SequenceData so repeated training reuses the same arrays.
+"""
 # Basic LSTM training script for sequence regression using PyTorch
 # - Loads X.npy, y.npy for training
 # - Evaluates on X_test.npy, y_test.npy and reports MSE
@@ -36,6 +56,17 @@ except Exception as e:
 
 @dataclass
 class Config:
+    """Lightweight configuration for training and plotting.
+
+    Attributes
+    - data_dir: folder containing X.npy, y.npy, X_test.npy, y_test.npy
+    - batch_size, lr, weight_decay: optimizer/dataloader settings
+    - max_epochs, hidden_size, num_layers, dropout: LSTM hyperparameters
+    - val_ratio: fraction of training set used for validation each run
+    - seed: global seed for numpy/torch RNGs
+    - num_workers: PyTorch DataLoader workers (keep 0 for portability)
+    - plot_path: where to save the MSE-vs-epoch PNG
+    """
     data_dir: str = os.path.join(os.path.dirname(__file__), "data")
     batch_size: int = 128
     lr: float = 1e-3
@@ -51,6 +82,7 @@ class Config:
 
 
 def set_seed(seed: int = 42):
+    """Seed random generators across python, numpy and torch for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -59,6 +91,7 @@ def set_seed(seed: int = 42):
 
 
 def select_device():
+    """Pick the fastest available device (MPS > CUDA > CPU)."""
     # Prefer Apple Silicon MPS if available, else CUDA, else CPU
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
@@ -68,6 +101,12 @@ def select_device():
 
 
 def load_arrays(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load numpy arrays from disk.
+
+    Returns
+    - x, y: training inputs/targets
+    - x_te, y_te: test inputs/targets
+    """
     x = np.load(os.path.join(data_dir, "X.npy"))
     y = np.load(os.path.join(data_dir, "y.npy"))
     x_te = np.load(os.path.join(data_dir, "X_test.npy"))
@@ -76,6 +115,7 @@ def load_arrays(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.n
 
 
 def ensure_3d_X(X: np.ndarray) -> np.ndarray:
+    """Ensure inputs have shape (N, T, F). If (N, T), append a unit feature dim."""
     # Ensure shape (N, T, F)
     if X.ndim == 3:
         return X
@@ -85,6 +125,10 @@ def ensure_3d_X(X: np.ndarray) -> np.ndarray:
 
 
 def normalize(X_train: np.ndarray, X_other: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Standardize both arrays using mean/std computed from X_train over (N, T).
+
+    Returns standardized copies of X_train and X_other.
+    """
     # Standardize features using train statistics only
     # X shape: (N, T, F)
     mu = X_train.mean(axis=(0, 1), keepdims=True)
@@ -93,6 +137,11 @@ def normalize(X_train: np.ndarray, X_other: np.ndarray) -> Tuple[np.ndarray, np.
 
 
 class LSTMRegressor(torch.nn.Module):
+    """LSTM backbone for sequence regression.
+
+    Predicts either a single value per sequence (seq_to_one) from the final hidden
+    state, or a value per timestep (seq_to_seq) from the sequence outputs.
+    """
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, out_dim: int, seq_to_seq: bool):
         super().__init__()
         self.seq_to_seq = seq_to_seq
@@ -106,6 +155,13 @@ class LSTMRegressor(torch.nn.Module):
         self.head = torch.nn.Linear(hidden_size, out_dim)
 
     def forward(self, x):
+        """Forward pass.
+
+        Args
+        - x: (B, T, F) float32 tensor
+        Returns
+        - (B, 1) if seq_to_seq is False, else (B, T, 1)
+        """
         # x: (B, T, F)
         out, (h_n, c_n) = self.lstm(x)
         if self.seq_to_seq:
@@ -118,6 +174,13 @@ class LSTMRegressor(torch.nn.Module):
 
 
 def make_targets(y: np.ndarray) -> Tuple[np.ndarray, int, bool]:
+    """Coerce y to supported targets and report output configuration.
+
+    Returns
+    - y_processed: (N,1) for seq-to-one or (N,T,1) for seq-to-seq
+    - out_dim: always 1 here
+    - seq_to_seq: True if per-timestep regression
+    """
     # Returns (y_processed, out_dim, seq_to_seq)
     if y.ndim == 1:
         y = y[:, None]
@@ -137,6 +200,10 @@ def make_targets(y: np.ndarray) -> Tuple[np.ndarray, int, bool]:
 
 
 def train_val_split_tensor(tensor: torch.Tensor, val_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Randomly split a tensor along dim 0 into train/val using val_ratio.
+
+    Ensures at least 1 validation element for tiny datasets.
+    """
     n = tensor.shape[0]
     n_val = max(1, int(n * val_ratio)) if n > 10 else max(1, int(n * 0.2))
     idx = torch.randperm(n)
@@ -179,6 +246,7 @@ class SequenceData:
         self.seq_to_seq = seq_to_seq
 
     def tensors(self):
+        """Return float32 torch tensors for train and test arrays."""
         X_t = torch.from_numpy(self.X.astype(np.float32))
         y_t = torch.from_numpy(self.y.astype(np.float32))
         Xte_t = torch.from_numpy(self.X_te.astype(np.float32))
@@ -190,6 +258,7 @@ _DATA_CACHE = None  # module-level cache
 
 
 def get_data(cfg: Config) -> SequenceData:
+    """Return a cached SequenceData for the configured data directory."""
     global _DATA_CACHE
     if _DATA_CACHE is None or getattr(_DATA_CACHE, "data_dir", None) != cfg.data_dir:
         _DATA_CACHE = SequenceData(cfg.data_dir)
@@ -197,6 +266,10 @@ def get_data(cfg: Config) -> SequenceData:
 
 
 def train_model(cfg: Config) -> dict:
+    """Train an LSTM on the loaded data and produce a learning-curve plot.
+
+    Returns a results dict with device info, shapes, final test MSE, and plot path.
+    """
     set_seed(cfg.seed)
     device = select_device()
 
@@ -210,7 +283,7 @@ def train_model(cfg: Config) -> dict:
     out_dim = data.out_dim
     seq_to_seq = data.seq_to_seq
 
-    # Train/Val split
+    # Train/Val split (use same random indices shape-wise by splitting tensor separately)
     Xtr_t, Xval_t = train_val_split_tensor(X_t, cfg.val_ratio)
     ytr_t, yval_t = train_val_split_tensor(y_t, cfg.val_ratio)
 
@@ -277,8 +350,8 @@ def train_model(cfg: Config) -> dict:
 
     # Plot only MSE curves (no scatter/prediction plot)
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    ax.plot(train_losses, label="train", linestyle='--')
-    ax.plot(val_losses, label="val", linestyle='-')
+    ax.plot(train_losses, label="train", linestyle='--')  # dashed for train
+    ax.plot(val_losses, label="val", linestyle='-')      # solid for val
     ax.set_title("MSE vs Epoch")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MSE")
