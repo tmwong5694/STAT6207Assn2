@@ -1,7 +1,7 @@
 # Advanced RNN (GRU) training script for sequence regression using PyTorch
 # - Trains a GRU-based regressor (no LSTM, no Transformer) on X.npy, y.npy
 # - Compares different values of one hyperparameter (now: number of epochs)
-# - Evaluates on X_test.npy, y_test.npy and displays plots (no PDF saving)
+# - Evaluates on X_test.npy, y_test.npy and saves a plot (PNG) + displays it
 # - Runs inference on X_test2.npy and saves predictions to a2_test.json
 #
 # Shapes:
@@ -35,7 +35,8 @@ class Model:
                  epochs_grid: Tuple[int, ...] = (5, 10, 15),
                  # Fixed RNN hidden size
                  base_hidden_size: int = 64,
-                 a2_json_path: str = None):
+                 a2_json_path: str = None,
+                 plot_path: str = None):
         # Hyperparameters
         self.lr = lr
         self.weight_decay = weight_decay
@@ -51,6 +52,7 @@ class Model:
         # Output paths (default to repo root)
         base_dir = os.path.dirname(__file__)
         self.a2_json_path = a2_json_path or os.path.join(base_dir, "a2_test.json")
+        self.plot_path = plot_path or os.path.join(base_dir, "advanced_results.png")
 
         # Runtime state
         self.device = self._select_device()
@@ -334,10 +336,11 @@ class Model:
 
         plt.tight_layout()
 
-        # Only show the plot; do not save to PDF as requested
+        # Save PNG and also display
+        fig.savefig(self.plot_path, dpi=150)
+        print(f"Saved plot to {self.plot_path}")
         try:
             plt.show(block=False)
-            print("Displayed training/validation MSE plot (not saved to disk).")
         except Exception as e:
             print(f"Interactive display failed: {e}")
         finally:
