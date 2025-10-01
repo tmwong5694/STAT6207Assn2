@@ -1,7 +1,7 @@
 # Basic LSTM training script for sequence regression using PyTorch
 # - Loads X.npy, y.npy for training
 # - Evaluates on X_test.npy, y_test.npy and reports MSE
-# - Saves learning curves and prediction plots to basic_results.png
+# - Saves learning curves to basic_results.png and also shows them
 #
 # The script is defensive about data shapes:
 #   * X may be (N, T) or (N, T, F); it will reshape to (N, T, F)
@@ -273,40 +273,17 @@ def train_model(cfg: Config) -> dict:
     with torch.no_grad():
         yhat_te = model(Xte_t.to(device))
         test_mse = criterion(yhat_te, yte_t.to(device)).item()
-        yhat_te_np = yhat_te.detach().cpu().numpy()
+        # yhat_te_np = yhat_te.detach().cpu().numpy()  # no prediction plotting needed
 
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Loss curves
-    axes[0].plot(train_losses, label="train")
-    axes[0].plot(val_losses, label="val")
-    axes[0].set_title("MSE loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MSE")
-    axes[0].legend()
-
-    # Predictions plot
-    if not seq_to_seq:
-        # Flatten to 1D
-        y_true = yte_t.squeeze(-1).cpu().numpy()
-        y_pred = yhat_te_np.squeeze(-1)
-        axes[1].scatter(y_true, y_pred, s=10, alpha=0.6)
-        lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
-        axes[1].plot(lims, lims, 'r--', linewidth=1)
-        axes[1].set_xlabel("True")
-        axes[1].set_ylabel("Pred")
-        axes[1].set_title(f"Test scatter (MSE={test_mse:.4f})")
-    else:
-        # Plot first sample's sequence true vs pred
-        y_true = yte_t[0].squeeze(-1).cpu().numpy()
-        y_pred = yhat_te_np[0].squeeze(-1)
-        axes[1].plot(y_true, label="true")
-        axes[1].plot(y_pred, label="pred")
-        axes[1].set_title(f"Test sequence (sample 0) MSE={test_mse:.4f}")
-        axes[1].set_xlabel("Timestep")
-        axes[1].set_ylabel("Value")
-        axes[1].legend()
+    # Plot only MSE curves (no scatter/prediction plot)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    ax.plot(train_losses, label="train", linestyle='--')
+    ax.plot(val_losses, label="val", linestyle='-')
+    ax.set_title("MSE vs Epoch")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
 
     plt.tight_layout()
     fig.savefig(cfg.plot_path, dpi=150)
