@@ -4,7 +4,8 @@ Advanced sequence regression using a GRU-based RNN in PyTorch (no LSTM, no Trans
 What this file does
 - Loads training/test arrays from the local data folder and keeps them cached on the Model instance.
 - Normalizes inputs using statistics computed on the training set only.
-- Trains a GRU-based regressor while comparing different epoch budgets (epochs_grid).
+- Trains a GRU-based regressor while comparing different hidden sizes (hidden_size_grid),
+  with a fixed number of epochs per run (max_epochs, default 15).
 - Plots MSE vs Epoch for each run (train dashed, val solid) using fixed colors (red/green/blue),
   saves to advanced_results.png, and also shows the figure interactively.
 - Generates predictions for X_test2.npy and writes them to a2_test.json with string keys '0', '1', ...
@@ -17,7 +18,7 @@ Input/Output shapes (defensive handling)
 
 Notes
 - Device selection prefers Apple Silicon MPS, then CUDA, else CPU.
-- The same train/val split is shared across all epoch settings for a fair comparison.
+- The same train/val split is shared across all hidden-size runs for a fair comparison.
 """
 # Advanced RNN (GRU) training script for sequence regression using PyTorch
 # - Trains a GRU-based regressor (no LSTM, no Transformer) on X.npy, y.npy
@@ -50,7 +51,7 @@ class Model:
 
         model = Model()
         model.load_data('./data')
-        model.train()            # runs multiple epoch budgets in epochs_grid
+        model.train()            # runs multiple hidden sizes in hidden_size_grid
         test_mse, yhat, y2 = model.evaluate()
         model.plot_and_save(test_mse, yhat)
         model.save_results(test_mse, y2)
@@ -64,9 +65,9 @@ class Model:
                  dropout: float = 0.1,
                  val_ratio: float = 0.1,
                  seed: int = 42,
-                 # Hyperparameter comparison now focuses on training epochs
-                 epochs_grid: Tuple[int, ...] = (5, 10, 15),
-                 # Fixed RNN hidden size
+                 # Hyperparameter comparison now focuses on hidden size
+                 hidden_size_grid: Tuple[int, ...] = (16, 32, 64),
+                 # Base/initial hidden size (not swept if grid provided)
                  base_hidden_size: int = 64,
                  a2_json_path: str = None,
                  plot_path: str = None):
@@ -74,12 +75,12 @@ class Model:
         self.lr = lr
         self.weight_decay = weight_decay
         self.batch_size = batch_size
-        self.max_epochs = max_epochs  # default cap; per-run uses epochs_grid value
+        self.max_epochs = max_epochs
         self.num_layers = num_layers
         self.dropout = dropout
         self.val_ratio = val_ratio
         self.seed = seed
-        self.epochs_grid = epochs_grid
+        self.hidden_size_grid = hidden_size_grid
         self.base_hidden_size = base_hidden_size
 
         # Output paths (default to repo root)
@@ -328,7 +329,7 @@ class Model:
         }
 
     def train(self):
-        """Run multiple training runs over epochs_grid and keep the best model (by val MSE)."""
+        """Run multiple training runs over hidden_size_grid and keep the best model (by val MSE)."""
         assert self.X is not None, "Call load_data(folder) first."
         # Prepare tensors
         X_t = torch.from_numpy(self.X.astype(np.float32))
@@ -340,14 +341,14 @@ class Model:
         ytr_t, yval_t = y_t[train_idx], y_t[val_idx]
 
         self.runs = []
-        for num_epochs in self.epochs_grid:
-            res = self._train_one(self.base_hidden_size, int(num_epochs), Xtr_t, ytr_t, Xval_t, yval_t)
+        for h in self.hidden_size_grid:
+            res = self._train_one(int(h), int(self.max_epochs), Xtr_t, ytr_t, Xval_t, yval_t)
             self.runs.append(res)
 
         best = min(self.runs, key=lambda r: r["best_val_mse"])
         self.best_model = best["model"]
         self.best_hidden_size = best["hidden_size"]
-        self.best_max_epochs = best["max_epochs"]
+        self.best_max_epochs = int(self.max_epochs)
         return best
 
     def evaluate(self) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -372,32 +373,31 @@ class Model:
     # Reporting
     # ------------------
     def plot_and_save(self, test_mse: float, yhat_te_np: np.ndarray):
-        """Plot MSE vs epoch for each epochs setting, save PNG, and show interactively.
+        """Plot MSE vs epoch for each hidden size, save PNG, and show interactively.
 
         Styling:
-        - Colors: red, green, blue mapped to the unique values in epochs_grid.
+        - Colors: red, green, blue mapped to the unique hidden sizes.
         - Train curves: dashed; Validation curves: solid.
         """
-        # Single-plot figure: MSE vs epoch for each epochs setting
+        # Single-plot figure: MSE vs epoch for each hidden size
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
 
-        # Prepare colors: fixed three pairs (red, green, blue) for the three epoch settings
-        sorted_runs = sorted(self.runs, key=lambda x: x["max_epochs"]) if self.runs else []
-        unique_E = sorted({r["max_epochs"] for r in sorted_runs})
+        # Prepare colors for hidden sizes
+        sorted_runs = sorted(self.runs, key=lambda x: x["hidden_size"]) if self.runs else []
+        unique_H = sorted({r["hidden_size"] for r in sorted_runs})
         base_colors = ['red', 'green', 'blue']
-        # Map each unique epoch value to a color, cycling if more than 3
-        color_map = {E: base_colors[i % len(base_colors)] for i, E in enumerate(unique_E)}
+        color_map = {H: base_colors[i % len(base_colors)] for i, H in enumerate(unique_H)}
 
         for r in sorted_runs:
-            E = r["max_epochs"]
-            color = color_map[E]
+            H = r["hidden_size"]
+            color = color_map[H]
             # Validation: solid line; Training: dashed line
-            ax.plot(r["val_losses"], color=color, linestyle='-', label=f"val (E={E})")
-            ax.plot(r["train_losses"], color=color, linestyle='--', alpha=0.9, label=f"train (E={E})")
+            ax.plot(r["val_losses"], color=color, linestyle='-', label=f"val (H={H})")
+            ax.plot(r["train_losses"], color=color, linestyle='--', alpha=0.9, label=f"train (H={H})")
 
         ax.set_xlabel("Epoch")
         ax.set_ylabel("MSE")
-        ax.set_title(f"MSE vs Epoch (RNN hidden_size={self.best_hidden_size})")
+        ax.set_title(f"MSE vs Epoch (hidden sizes {unique_H}, epochs={self.max_epochs})")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
