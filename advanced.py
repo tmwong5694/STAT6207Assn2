@@ -314,54 +314,27 @@ class Model:
     # Reporting
     # ------------------
     def plot_and_save(self, test_mse: float, yhat_te_np: np.ndarray):
-        # Figure: (1) Validation MSE vs epoch for each epochs setting; (2) test visualization
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        # Single-plot figure: MSE vs epoch for each epochs setting
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
 
-        # Panel 1: loss curves across epochs for different training lengths
+        # Prepare colors: same color for the same hyperparameter (epochs)
         sorted_runs = sorted(self.runs, key=lambda x: x["max_epochs"]) if self.runs else []
-        unique_E = [r["max_epochs"] for r in sorted_runs]
-        # Use a consistent colormap, same color for the same hyperparam (epochs)
+        unique_E = sorted({r["max_epochs"] for r in sorted_runs})
         cmap = plt.cm.get_cmap('tab10', max(1, len(unique_E)))
         color_map = {E: cmap(i % cmap.N) for i, E in enumerate(unique_E)}
+
         for r in sorted_runs:
             E = r["max_epochs"]
             color = color_map[E]
-            # val: solid, train: dashed; same color per E
-            axes[0].plot(r["val_losses"], color=color, linestyle='-', label=f"val (E={E})")
-            axes[0].plot(r["train_losses"], color=color, linestyle='--', alpha=0.9, label=f"train (E={E})")
-        axes[0].set_xlabel("Epoch")
-        axes[0].set_ylabel("MSE")
-        axes[0].set_title(f"MSE vs Epoch (RNN hidden_size={self.best_hidden_size})")
-        axes[0].legend(fontsize=8)
-        axes[0].grid(True, alpha=0.3)
+            # Validation: solid line; Training: dashed line
+            ax.plot(r["val_losses"], color=color, linestyle='-', label=f"val (E={E})")
+            ax.plot(r["train_losses"], color=color, linestyle='--', alpha=0.9, label=f"train (E={E})")
 
-        # Find best run
-        best_run = min(self.runs, key=lambda r: r["best_val_mse"]) if self.runs else None
-
-        # Panel 2: Predictions visualization on test
-        if best_run is not None:
-            if not self.seq_to_seq:
-                y_true = self.y_test.squeeze(-1)
-                y_pred = yhat_te_np.squeeze(-1)
-                axes[1].scatter(y_true, y_pred, s=10, alpha=0.6)
-                minv = float(min(y_true.min(), y_pred.min()))
-                maxv = float(max(y_true.max(), y_pred.max()))
-                axes[1].plot([minv, maxv], [minv, maxv], 'r--', linewidth=1)
-                axes[1].set_xlabel("True")
-                axes[1].set_ylabel("Pred")
-                axes[1].set_title(f"Test scatter (MSE={test_mse:.4f}, E={best_run['max_epochs']})")
-            else:
-                y_true = self.y_test[0].squeeze(-1)
-                y_pred = yhat_te_np[0].squeeze(-1)
-                axes[1].plot(y_true, label="true")
-                axes[1].plot(y_pred, label="pred")
-                axes[1].set_xlabel("Timestep")
-                axes[1].set_ylabel("Value")
-                axes[1].set_title(f"Test sequence (sample 0) MSE={test_mse:.4f}, E={best_run['max_epochs']}")
-                axes[1].legend()
-        else:
-            axes[1].text(0.5, 0.5, "No run info", ha='center', va='center')
-            axes[1].set_axis_off()
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("MSE")
+        ax.set_title(f"MSE vs Epoch (RNN hidden_size={self.best_hidden_size})")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
         fig.savefig(self.plot_pdf_path, dpi=150)
@@ -419,3 +392,5 @@ if __name__ == '__main__':
     test_mse, yhat_te_np, yhat_te2 = model.evaluate()
     model.plot_and_save(test_mse, yhat_te_np)
     model.save_results(test_mse, yhat_te2)
+
+    pass
