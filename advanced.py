@@ -1,9 +1,8 @@
 # Advanced RNN (GRU) training script for sequence regression using PyTorch
 # - Trains a GRU-based regressor (no LSTM, no Transformer) on X.npy, y.npy
 # - Compares different values of one hyperparameter (now: number of epochs)
-# - Evaluates on X_test.npy, y_test.npy and saves plots to advanced_results.pdf
+# - Evaluates on X_test.npy, y_test.npy and displays plots (no PDF saving)
 # - Runs inference on X_test2.npy and saves predictions to a2_test.json
-# - Saves a summary to advanced_results.json
 #
 # Shapes:
 #   * X may be (N, T) or (N, T, F) -> we ensure (N, T, F)
@@ -36,8 +35,6 @@ class Model:
                  epochs_grid: Tuple[int, ...] = (5, 10, 15),
                  # Fixed RNN hidden size
                  base_hidden_size: int = 64,
-                 plot_pdf_path: str = None,
-                 results_json_path: str = None,
                  a2_json_path: str = None):
         # Hyperparameters
         self.lr = lr
@@ -53,8 +50,6 @@ class Model:
 
         # Output paths (default to repo root)
         base_dir = os.path.dirname(__file__)
-        self.plot_pdf_path = plot_pdf_path or os.path.join(base_dir, "advanced_results.pdf")
-        self.results_json_path = results_json_path or os.path.join(base_dir, "advanced_results.json")
         self.a2_json_path = a2_json_path or os.path.join(base_dir, "a2_test.json")
 
         # Runtime state
@@ -121,7 +116,7 @@ class Model:
         self.out_dim = out_dim
         self.seq_to_seq = seq_to_seq
 
-        return X, y, X_test, y_test
+        return X, y, X_test, y_test, X_test2
 
     @staticmethod
     def _ensure_3d_X(X: np.ndarray) -> np.ndarray:
@@ -317,11 +312,12 @@ class Model:
         # Single-plot figure: MSE vs epoch for each epochs setting
         fig, ax = plt.subplots(1, 1, figsize=(8, 5))
 
-        # Prepare colors: same color for the same hyperparameter (epochs)
+        # Prepare colors: fixed three pairs (red, green, blue) for the three epoch settings
         sorted_runs = sorted(self.runs, key=lambda x: x["max_epochs"]) if self.runs else []
         unique_E = sorted({r["max_epochs"] for r in sorted_runs})
-        cmap = plt.cm.get_cmap('tab10', max(1, len(unique_E)))
-        color_map = {E: cmap(i % cmap.N) for i, E in enumerate(unique_E)}
+        base_colors = ['red', 'green', 'blue']
+        # Map each unique epoch value to a color, cycling if more than 3
+        color_map = {E: base_colors[i % len(base_colors)] for i, E in enumerate(unique_E)}
 
         for r in sorted_runs:
             E = r["max_epochs"]
@@ -337,38 +333,18 @@ class Model:
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        fig.savefig(self.plot_pdf_path, dpi=150)
-        print(f"Saved PDF plot to {self.plot_pdf_path}")
 
+        # Only show the plot; do not save to PDF as requested
         try:
             plt.show(block=False)
+            print("Displayed training/validation MSE plot (not saved to disk).")
         except Exception as e:
             print(f"Interactive display failed: {e}")
         finally:
             plt.close(fig)
 
     def save_results(self, test_mse: float, yhat_te2: np.ndarray):
-        # advanced_results.json
-        results = {
-            "device": str(self.device),
-            "input_shape": list(self.X.shape),
-            "target_shape": list(self.y.shape),
-            "test_input_shape": list(self.X_test.shape),
-            "test_target_shape": list(self.y_test.shape),
-            "seq_to_seq": bool(self.seq_to_seq),
-            "base_hidden_size": int(self.base_hidden_size),
-            "epochs_grid": list(self.epochs_grid),
-            "val_mse_by_max_epochs": {str(r["max_epochs"]): float(r["best_val_mse"]) for r in self.runs},
-            "best_hidden_size": int(self.best_hidden_size),
-            "best_max_epochs": int(self.best_max_epochs),
-            "test_mse": float(test_mse),
-            "plot_pdf_path": self.plot_pdf_path,
-        }
-        with open(self.results_json_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Saved results to {self.results_json_path}")
-
-        # a2_test.json
+        # Only save a2_test.json with predictions for X_test2
         submit: Dict[str, object] = {}
         if not self.seq_to_seq:
             vals = yhat_te2.squeeze(-1).tolist()
